@@ -1,280 +1,438 @@
 // functions/_lib/mediafire.js
-// ★ proxy route ရော direct route ရော နှစ်ခုလုံး မျှသုံးတဲ့ helper
-// ★ MediaFire OFFICIAL API ဦးစားပေး → normal_download HTML → data-scrambled-url decode
-// ★ direct link မြန်အောင် KV cache + background write
+// MediaFire helper — direct redirect + proxy route နှစ်ခုလုံးသုံး
+// API first, HTML scrape fallback, KV cache TTL, stale refresh
 
-export const CACHE_TTL = 1200;       // direct link cache — 20 မိနစ်
-export const NEG_TTL   = 30;          // resolve fail negative-cache — 30 စက္ကန့်
-export const NAME_TTL  = 86400;       // filename cache — 1 ရက် (filename မပြောင်းလို့ ကြာကြာထား)
+export const DIRECT_CACHE_TTL = 600; // 10 minutes — MediaFire CDN link expire ဖြစ်တတ်လို့ တိုတိုထား
+export const NAME_CACHE_TTL = 86400; // 1 day
+export const LINK_TTL = 60 * 60 * 24 * 30; // /api/resolve က add လုပ်တဲ့ original MF link TTL: 30 days
 
 export const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) " +
   "Gecko/20100101 Firefox/131.0";
 
-// ──────────────────────────────────────────────────
-// id validate (KV key injection ကာကွယ်)
+export const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type,Range",
+};
+
+// ─────────────────────────────────────────────
+// ID validate — KV key injection ကာကွယ်
 export function isValidId(id) {
-  return /^[a-zA-Z0-9_-]{1,64}$/.test(id);
+  return /^[a-zA-Z0-9_-]{1,80}$/.test(id || "");
 }
 
-// ──────────────────────────────────────────────────
-// MediaFire quick_key (11 လုံး alnum) ထုတ်
-export function extractQuickKey(mfUrl, idHint) {
-  const m = (mfUrl || "").match(
-    /mediafire\.com\/(?:file|file_premium|view|download|\?)\/?([a-zA-Z0-9]{11,15})/i
-  );
-  if (m && m[1]) return m[1];
-  // ?quickkey= / ?<key> pattern
-  const m2 = (mfUrl || "").match(/[?&]([a-zA-Z0-9]{11,15})(?:[&,]|$)/);
-  if (m2 && m2[1]) return m2[1];
-  if (idHint && /^[a-zA-Z0-9]{11,15}$/.test(idHint)) return idHint;
-  return null;
-}
-
-// ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────
 // path segments → { id, urlFilename }
 export function parsePath(params) {
   let segments = params.path;
   if (typeof segments === "string") segments = [segments];
   if (!Array.isArray(segments) || segments.length === 0) return null;
 
-  let id = segments[0];
+  let id = segments[0] || "";
   if (id.includes(".")) id = id.substring(0, id.lastIndexOf("."));
 
   let urlFilename = "";
   if (segments.length >= 2) {
-    try {
-      urlFilename = decodeURIComponent(segments[segments.length - 1]);
-    } catch (_) {
-      urlFilename = segments[segments.length - 1];
-    }
+    urlFilename = cleanFilename(segments[segments.length - 1]);
   }
+
   return { id, urlFilename };
 }
 
-// ──────────────────────────────────────────────────
-// ★ direct link ရယူ — cache ဦးစားပေး၊ မရမှ resolve
+// ─────────────────────────────────────────────
+// KV 3 keys ကို one operation နဲ့ဖတ်
+export async function readLinkRecord(env, id) {
+  const keys = [id, "name:" + id, "direct:" + id];
+
+  // Workers KV supports get(array) => Map
+  const map = await env.LINKS.get(keys);
+
+  return {
+    mfUrl: map.get(id) || null,
+    customName: map.get("name:" + id) || "",
+    cachedDirect: map.get("direct:" + id) || "",
+  };
+}
+
+// ─────────────────────────────────────────────
+// direct link ရယူ — cached direct first, မရမှ resolve
 // return: { direct, filename, fromCache }
-export async function getDirectLink(env, ctx, id, mfUrl, cachedDirect, cachedName) {
-  if (cachedDirect) {
-    return { direct: cachedDirect, filename: cachedName || "", fromCache: true };
+export async function getDirectLink(
+  env,
+  ctx,
+  id,
+  mfUrl,
+  cachedDirect = "",
+  customName = "",
+  options = {}
+) {
+  const forceFresh = !!options.forceFresh;
+
+  if (!forceFresh && cachedDirect && looksLikeMediafireDirect(cachedDirect)) {
+    return {
+      direct: cachedDirect,
+      filename: customName || "",
+      fromCache: true,
+    };
   }
 
   const meta = await resolveMediafire(mfUrl, id);
   if (!meta || !meta.direct) return null;
 
-  // ★ KV write ကို background (response မစောင့်)
-  ctx.waitUntil(
-    env.LINKS.put("direct:" + id, meta.direct, { expirationTtl: CACHE_TTL })
-  );
-  // filename ကို custom မရှိမှသာ cache (custom ရှိရင် override မလုပ်)
-  if (meta.filename && !cachedName) {
-    ctx.waitUntil(
-      env.LINKS.put("name:" + id, meta.filename, { expirationTtl: NAME_TTL })
-    );
-  }
+  cacheResolved(env, ctx, id, meta.direct, meta.filename, customName);
+
   return {
     direct: meta.direct,
-    filename: cachedName || meta.filename || "",
+    filename: meta.filename || "",
     fromCache: false,
   };
 }
 
-// ──────────────────────────────────────────────────
-// re-resolve (cache link expire ဖြစ်ရင်) — direct ပြန်ပေး
-export async function reResolve(env, ctx, id, mfUrl) {
+// ─────────────────────────────────────────────
+// cache link expire ဖြစ်ရင် re-resolve
+export async function reResolve(env, ctx, id, mfUrl, customName = "") {
   const meta = await resolveMediafire(mfUrl, id);
   if (!meta || !meta.direct) return null;
-  ctx.waitUntil(
-    env.LINKS.put("direct:" + id, meta.direct, { expirationTtl: CACHE_TTL })
-  );
+
+  cacheResolved(env, ctx, id, meta.direct, meta.filename, customName);
   return meta.direct;
 }
 
-// ──────────────────────────────────────────────────
-// filename ဆုံးဖြတ် (priority order)
-export function pickFilename(urlFilename, customName, metaFilename, mfUrl, direct) {
-  return (
-    urlFilename ||
-    customName ||
-    metaFilename ||
-    extractFilename(mfUrl, direct)
+// ─────────────────────────────────────────────
+// background cache writes — KV 429 ဖြစ်လည်း response မပျက်အောင် catch
+export function cacheResolved(env, ctx, id, direct, filename = "", customName = "") {
+  if (!env?.LINKS || !ctx?.waitUntil) return;
+
+  ctx.waitUntil(
+    putSafe(
+      env.LINKS.put("direct:" + id, direct, {
+        expirationTtl: DIRECT_CACHE_TTL,
+      })
+    )
   );
+
+  if (filename && !customName) {
+    ctx.waitUntil(
+      putSafe(
+        env.LINKS.put("name:" + id, filename, {
+          expirationTtl: NAME_CACHE_TTL,
+        })
+      )
+    );
+  }
 }
 
-// ──────────────────────────────────────────────────
+export async function putSafe(promise) {
+  try {
+    return await promise;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
+// filename ဆုံးဖြတ် priority
+export function pickFilename(urlFilename, customName, metaFilename, mfUrl, direct) {
+  const name =
+    cleanFilename(urlFilename) ||
+    cleanFilename(customName) ||
+    cleanFilename(metaFilename) ||
+    extractFilename(mfUrl, direct);
+
+  return name || "download.mp4";
+}
+
 export function sanitizeAscii(name) {
-  return name.replace(/["\\\r\n]/g, "_").replace(/[^\x20-\x7E]/g, "_");
+  return String(name || "download.mp4")
+    .replace(/["\\\r\n]/g, "_")
+    .replace(/[^\x20-\x7E]/g, "_");
 }
 
-// ──────────────────────────────────────────────────
-function extractFilename(mfUrl, directUrl) {
+// ─────────────────────────────────────────────
+// MediaFire original URL normalize/validate
+export function normalizeMediafireUrl(input) {
+  let url = String(input || "").trim();
+
+  if (!url) return "";
+  if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+
   try {
-    const parts = new URL(mfUrl).pathname.split("/").filter(Boolean);
-    if ((parts[0] === "file" || parts[0] === "file_premium") && parts.length >= 3) {
-      let name = decodeURIComponent(parts[2]);
-      // MediaFire တစ်ခါတစ်ခါ double-encode (%255B) ဖြစ်တတ်
-      if (name.includes("%")) {
-        try { name = decodeURIComponent(name); } catch (_) {}
-      }
-      if (name.includes(".")) return name;
-    }
-  } catch (_) {}
-  try {
-    const dParts = new URL(directUrl).pathname.split("/").filter(Boolean);
-    const last = decodeURIComponent(dParts[dParts.length - 1] || "");
-    if (last.includes(".")) return last;
-  } catch (_) {}
-  return "download.mp4";
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+
+    if (host !== "mediafire.com" && host !== "www.mediafire.com") return "";
+
+    const key = extractQuickKey(url);
+    if (!key) return "";
+
+    return u.toString();
+  } catch (_) {
+    return "";
+  }
 }
 
-// ──────────────────────────────────────────────────
-// ★ MediaFire resolve — API ဦးစားပေး၊ မရမှ HTML scrape
-// return: { direct, filename } | null
-export async function resolveMediafire(mfUrl, idHint) {
-  const key = extractQuickKey(mfUrl, idHint);
+// ─────────────────────────────────────────────
+// quick_key extract
+export function extractQuickKey(mfUrl) {
+  try {
+    const u = new URL(mfUrl);
+    const path = u.pathname;
 
-  // (1) Official API — filename + normal_download page ရ
-  if (key) {
+    // /file/{quick_key}/filename/file
+    // /file_premium/{quick_key}/...
+    let m = path.match(/\/(?:file|file_premium)\/([a-zA-Z0-9]+)(?:\/|$)/i);
+    if (m?.[1]) return m[1];
+
+    // fallback
+    m = mfUrl.match(/mediafire\.com\/(?:file|file_premium)\/([a-zA-Z0-9]+)/i);
+    if (m?.[1]) return m[1];
+
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
+// ─────────────────────────────────────────────
+// stable short id for /api/resolve
+export async function idFromUrl(mfUrl) {
+  const key = extractQuickKey(mfUrl);
+  if (key) return key;
+
+  const data = new TextEncoder().encode(mfUrl);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const bytes = Array.from(new Uint8Array(digest));
+  return bytes.map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
+// ─────────────────────────────────────────────
+// MediaFire resolve — API first, HTML scrape fallback
+export async function resolveMediafire(mfUrl, idHint = "") {
+  mfUrl = normalizeMediafireUrl(mfUrl) || mfUrl;
+
+  let key = extractQuickKey(mfUrl) || idHint;
+  let apiFilename = "";
+  let apiNormal = "";
+
+  // 1) Official API — filename + normal_download ရယူ
+  if (key && /^[a-zA-Z0-9]+$/.test(key)) {
     try {
       const apiUrl =
-        "https://www.mediafire.com/api/1.5/file/get_info.php?quick_key=" +
-        key + "&response_format=json";
-      const apiRes = await fetch(apiUrl, {
-        headers: { "User-Agent": UA, Accept: "application/json" },
-      });
+        "https://www.mediafire.com/api/file/get_info.php?quick_key=" +
+        encodeURIComponent(key) +
+        "&response_format=json";
+
+      const apiRes = await fetchWithTimeout(
+        apiUrl,
+        {
+          headers: {
+            "User-Agent": UA,
+            Accept: "application/json,text/plain,*/*",
+          },
+          redirect: "follow",
+        },
+        7000
+      );
+
       if (apiRes.ok) {
-        const data = await apiRes.json().catch(() => null);
+        const data = await apiRes.json();
         const info = data?.response?.file_info;
-        const fname = info?.filename || "";
-        const normal = info?.links?.normal_download;
-        // ★ normal_download က HTML download-page → scrape လုပ်မှ direct
-        if (normal) {
-          const direct = await followToDirect(normal);
-          if (direct) return { direct, filename: fname };
+
+        apiFilename = cleanFilename(info?.filename || "");
+        apiNormal = info?.links?.normal_download || "";
+
+        if (apiNormal) {
+          const direct = await followToDirect(apiNormal);
+          if (direct) return { direct, filename: apiFilename };
         }
-        // API ရပေမယ့် link မရရင် filename တော့ မှတ်ထား → HTML fallback
-        const direct2 = await followToDirect(mfUrl);
-        if (direct2) return { direct: direct2, filename: fname };
-        return null;
       }
     } catch (_) {}
   }
 
-  // (2) HTML scrape fallback (API fail / key မရ)
-  const direct = await followToDirect(mfUrl);
-  return direct ? { direct, filename: "" } : null;
+  // 2) HTML scrape fallback — original page
+  try {
+    const direct = await followToDirect(mfUrl);
+    if (direct) {
+      return {
+        direct,
+        filename: apiFilename || extractFilename(mfUrl, direct),
+      };
+    }
+  } catch (_) {}
+
+  return null;
 }
 
-// ──────────────────────────────────────────────────
-// URL ကို fetch → တကယ့် direct file link ရအောင်
-// MediaFire download-page မှ data-scrambled-url (base64) ကို decode
-async function followToDirect(url, depth = 0) {
-  if (depth > 3) return null; // redirect loop ကာကွယ်
-
-  let res;
-  try {
-    res = await fetch(url, {
+// ─────────────────────────────────────────────
+// URL fetch → real CDN direct link
+export async function followToDirect(url) {
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "GET",
       headers: {
         "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,*/*",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
       },
       redirect: "follow",
-    });
-  } catch (_) {
-    return null;
-  }
-
-  const ctype = (res.headers.get("content-type") || "").toLowerCase();
-
-  // ★ HTML မဟုတ်ရင် = ကိုယ်တိုင် direct file ဖြစ်နေပြီ
-  if (!ctype.includes("text/html")) {
-    return res.url || url;
-  }
-
-  let html;
-  try {
-    html = await res.text();
-  } catch (_) {
-    return null;
-  }
-
-  const link = extractLinkFromHtml(html);
-  if (!link) return null;
-
-  // scrambled link က တစ်ခါတစ်ခါ download-page တစ်ဆင့်ထပ်ဖြစ်တတ် → recurse
-  if (/mediafire\.com\/(file|view|download)/i.test(link) && link !== url) {
-    const deeper = await followToDirect(link, depth + 1);
-    if (deeper) return deeper;
-  }
-  return link;
-}
-
-// ──────────────────────────────────────────────────
-// HTML ထဲမှ direct link ထုတ် (pattern များစွာ စမ်း)
-function extractLinkFromHtml(html) {
-  let link = null;
-
-  // (a) ★ အဓိက — id="downloadButton" data-scrambled-url="BASE64"
-  let m = html.match(
-    /id=["']downloadButton["'][^>]*\bdata-scrambled-url=["']([^"']+)["']/i
+    },
+    9000
   );
-  if (!m) {
-    // attribute order ပြောင်းနေရင်လည်း ဖမ်း
-    m = html.match(/\bdata-scrambled-url=["']([^"']+)["']/i);
-  }
-  if (m && m[1]) {
-    const decoded = safeAtob(m[1].trim());
-    if (decoded && /^https?:\/\//i.test(decoded)) link = decoded;
+
+  const finalUrl = res.url || url;
+  const ctype = res.headers.get("content-type") || "";
+  const dispo = res.headers.get("content-disposition") || "";
+
+  // fetch result ကိုယ်တိုင် CDN/file ဖြစ်နေပြီ
+  if (
+    looksLikeMediafireDirect(finalUrl) ||
+    dispo.toLowerCase().includes("attachment") ||
+    (ctype && !ctype.toLowerCase().includes("text/html"))
+  ) {
+    return finalUrl;
   }
 
-  // (b) downloadButton href တိုက်ရိုက် (scramble မပါတဲ့ case)
-  if (!link) {
-    m = html.match(/id=["']downloadButton["'][^>]*\bhref=["'](https?:[^"']+)["']/i);
-    if (m && m[1]) link = m[1];
-  }
-  if (!link) {
-    m = html.match(/\bhref=["'](https?:[^"']+)["'][^>]*id=["']downloadButton["']/i);
-    if (m && m[1]) link = m[1];
-  }
-
-  // (c) download.mediafire.com တိုက်ရိုက် link
-  if (!link) {
-    m = html.match(/href=["'](https?:\/\/download[^"']+)["']/i);
-    if (m && m[1]) link = m[1];
-  }
-
-  // (d) JS redirect: window.location.href = '...'
-  if (!link) {
-    m = html.match(/window\.location\.href\s*=\s*["'](https?:[^"']+)["']/i);
-    if (m && m[1]) link = m[1];
-  }
-
-  if (link) link = decodeHtmlEntities(link.trim());
-  return link;
+  const html = await res.text();
+  const direct = extractDirectFromHtml(html);
+  return direct || "";
 }
 
-// ──────────────────────────────────────────────────
-// base64 → string (atob fail-safe, URL-safe base64 လည်း ထောက်ပံ့)
-function safeAtob(b64) {
+// ─────────────────────────────────────────────
+// HTML ထဲက download*.mediafire.com link ကို robust extract
+export function extractDirectFromHtml(html) {
+  if (!html) return "";
+
+  const raw = String(html);
+  const decodedHtml = decodeHtmlEntities(raw);
+  const unescaped = decodedHtml.replace(/\\\//g, "/").replace(/\\/g, "");
+
+  // 1) data-scrambled-url="base64..."
+  let m = raw.match(/data-scrambled-url\s*=\s*["']([^"']+)["']/i);
+  if (m?.[1]) {
+    try {
+      const v = atob(m[1].trim());
+      if (looksLikeMediafireDirect(v)) return decodeHtmlEntities(v);
+    } catch (_) {}
+  }
+
+  // 2) direct download domain anywhere
+  const patterns = [
+    /href\s*=\s*["'](https?:\/\/download[^"']+mediafire\.com\/[^"']+)["']/gi,
+    /data-href\s*=\s*["'](https?:\/\/download[^"']+mediafire\.com\/[^"']+)["']/gi,
+    /["'](https?:\/\/download[^"']+mediafire\.com\/[^"']+)["']/gi,
+    /(https?:\/\/download[^\s"'<>]+mediafire\.com\/[^\s"'<>]+)/gi,
+  ];
+
+  for (const text of [decodedHtml, unescaped]) {
+    for (const re of patterns) {
+      re.lastIndex = 0;
+      while ((m = re.exec(text))) {
+        const candidate = cleanupUrl(m[1]);
+        if (looksLikeMediafireDirect(candidate)) return candidate;
+      }
+    }
+  }
+
+  // 3) JS location fallback
+  m = unescaped.match(/window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i);
+  if (m?.[1]) {
+    const candidate = cleanupUrl(m[1]);
+    if (looksLikeMediafireDirect(candidate)) return candidate;
+  }
+
+  return "";
+}
+
+// ─────────────────────────────────────────────
+export function looksLikeMediafireDirect(url) {
   try {
-    let s = b64.replace(/-/g, "+").replace(/_/g, "/");
-    const pad = s.length % 4;
-    if (pad) s += "=".repeat(4 - pad);
-    return atob(s);
+    const u = new URL(cleanupUrl(url));
+    const host = u.hostname.toLowerCase();
+
+    return (
+      /^download\d*\.mediafire\.com$/i.test(host) ||
+      /^download[^.]*\.mediafire\.com$/i.test(host)
+    );
   } catch (_) {
-    return null;
+    return false;
   }
 }
 
-// ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+export function cleanupUrl(url) {
+  return decodeHtmlEntities(String(url || ""))
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&")
+    .trim();
+}
+
+// ─────────────────────────────────────────────
+export function extractFilename(mfUrl, directUrl = "") {
+  try {
+    const parts = new URL(mfUrl).pathname.split("/").filter(Boolean);
+
+    // /file/{id}/{filename}/file
+    if ((parts[0] === "file" || parts[0] === "file_premium") && parts.length >= 3) {
+      const name = cleanFilename(parts[2]);
+      if (name && name.includes(".")) return name;
+    }
+  } catch (_) {}
+
+  try {
+    const dParts = new URL(directUrl).pathname.split("/").filter(Boolean);
+    const last = cleanFilename(dParts[dParts.length - 1] || "");
+    if (last && last.includes(".")) return last;
+  } catch (_) {}
+
+  return "download.mp4";
+}
+
+// double-encoded name တွေ %255B → %5B → [ ဖြစ်အောင်
+export function cleanFilename(name) {
+  let s = String(name || "").trim();
+  if (!s) return "";
+
+  s = s.replace(/\+/g, " ");
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      const d = decodeURIComponent(s);
+      if (d === s) break;
+      s = d;
+    } catch (_) {
+      break;
+    }
+  }
+
+  return s.replace(/[/\\?%*:|"<>]/g, "_").trim();
+}
+
+// ─────────────────────────────────────────────
 function decodeHtmlEntities(str) {
-  return str
+  return String(str || "")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&#0?39;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'")
     .replace(/&#x2F;/gi, "/");
+}
+
+// ─────────────────────────────────────────────
+async function fetchWithTimeout(url, init = {}, ms = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("timeout"), ms);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
