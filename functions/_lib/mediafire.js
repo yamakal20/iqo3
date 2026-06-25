@@ -2,7 +2,7 @@
 // ★ proxy route ရော direct route ရော နှစ်ခုလုံး မျှသုံးတဲ့ helper
 // ★ MediaFire OFFICIAL API ဦးစားပေး resolve (HTML scrape ထက်မြန်+တည်ငြိမ်)
 
-export const CACHE_TTL = 600; // direct link cache — 10 မိနစ်
+export const CACHE_TTL = 1200; // direct link cache — 20 မိနစ်
 
 export const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) " +
