@@ -1,47 +1,77 @@
 // functions/d/[[path]].js
-// ★ DIRECT route — /d/{id}.mp4 ၊ MediaFire CDN direct link ကို 302 redirect
-// ★ proxy မပါ၊ Cloudflare bandwidth မကုန်၊ browser က MediaFire ကို တန်းသွား
-// ★ KV cache + parallel reads + background writes (resolve မြန်)
+// DIRECT route — /d/{id}.mp4
+// MediaFire CDN direct link ကို 302 redirect
+// fastest mode: cached direct ရှိရင် ချက်ချင်း redirect
+// force fresh: /d/{id}.mp4?fresh=1
 
 import {
+  CORS_HEADERS,
   isValidId,
   parsePath,
+  readLinkRecord,
   getDirectLink,
 } from "../_lib/mediafire.js";
 
 export async function onRequest(context) {
   const { request, params, env } = context;
 
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
   if (request.method !== "GET" && request.method !== "HEAD") {
-    return new Response("Method not allowed", { status: 405 });
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: CORS_HEADERS,
+    });
   }
 
   const parsed = parsePath(params);
-  if (!parsed) return new Response("Invalid path", { status: 400 });
-  const { id } = parsed;
-  if (!isValidId(id)) return new Response("Invalid ID", { status: 400 });
+  if (!parsed) {
+    return new Response("Invalid path", { status: 400, headers: CORS_HEADERS });
+  }
 
-  // ★ KV reads parallel — round-trip တစ်ခါတည်း
-  const [mfUrl, cachedName, cachedDirect] = await Promise.all([
-    env.LINKS.get(id),
-    env.LINKS.get("name:" + id),
-    env.LINKS.get("direct:" + id),
-  ]);
-  if (!mfUrl) return new Response("ID ရှာမတွေ့ပါ", { status: 404 });
+  const { id } = parsed;
+  if (!isValidId(id)) {
+    return new Response("Invalid ID", { status: 400, headers: CORS_HEADERS });
+  }
+
+  const urlObj = new URL(request.url);
+  const fresh = urlObj.searchParams.get("fresh") === "1";
+
+  const { mfUrl, customName, cachedDirect } = await readLinkRecord(env, id);
+
+  if (!mfUrl) {
+    return new Response("ID ရှာမတွေ့ပါ", {
+      status: 404,
+      headers: CORS_HEADERS,
+    });
+  }
 
   const result = await getDirectLink(
-    env, context, id, mfUrl, cachedDirect, cachedName
+    env,
+    context,
+    id,
+    mfUrl,
+    fresh ? "" : cachedDirect,
+    customName,
+    { forceFresh: fresh }
   );
-  if (!result) return new Response("Direct link ရှာမတွေ့ပါ", { status: 502 });
 
-  // ★★★ proxy မလုပ်ဘဲ direct link ကို တန်း redirect ★★★
+  if (!result?.direct) {
+    return new Response("Direct link ရှာမတွေ့ပါ", {
+      status: 502,
+      headers: CORS_HEADERS,
+    });
+  }
+
   return new Response(null, {
     status: 302,
     headers: {
+      ...CORS_HEADERS,
       Location: result.direct,
-      // direct link expire နိုင်လို့ browser/CDN မှာ cache မလုပ်
       "Cache-Control": "no-store",
-      "Access-Control-Allow-Origin": "*",
+      "X-Direct-From-Cache": result.fromCache ? "1" : "0",
     },
   });
 }
