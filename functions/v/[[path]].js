@@ -1,10 +1,9 @@
 // functions/v/[[path]].js
 // ★ PROXY route — /v/{id}.mp4 ၊ Cloudflare ကနေ stream/download
 // ★ KV cache + parallel reads + background writes
-// ★ Range/seek/resume, attachment force-download
+// ★ Range/seek/resume, attachment force-download, expire → re-resolve
 
 import {
-  CACHE_TTL,
   UA,
   isValidId,
   parsePath,
@@ -44,26 +43,34 @@ export async function onRequest(context) {
     urlFilename, customName, result.filename, mfUrl, direct
   );
 
-  // upstream fetch (Range forward)
+  // upstream fetch (Range forward — seek/resume)
   const fwdHeaders = new Headers();
   const range = request.headers.get("Range");
   if (range) fwdHeaders.set("Range", range);
   fwdHeaders.set("User-Agent", UA);
+  fwdHeaders.set("Accept-Encoding", "identity"); // ★ video ကို re-compress မဖြစ်စေ
   const method = request.method === "HEAD" ? "HEAD" : "GET";
 
-  let upstream = await fetch(direct, { method, headers: fwdHeaders, redirect: "follow" });
+  let upstream = await fetch(direct, {
+    method, headers: fwdHeaders, redirect: "follow",
+  });
 
-  // cache link expire → re-resolve
+  // ★ cache link expire (403/404/410) → re-resolve ပြီး ထပ်ကြိုး
   if ([403, 404, 410].includes(upstream.status)) {
     const fresh = await reResolve(env, context, id, mfUrl);
-    if (fresh) {
+    if (fresh && fresh !== direct) {
       direct = fresh;
-      upstream = await fetch(direct, { method, headers: fwdHeaders, redirect: "follow" });
+      upstream = await fetch(direct, {
+        method, headers: fwdHeaders, redirect: "follow",
+      });
     }
   }
 
   const respHeaders = new Headers();
-  for (const h of ["content-length", "content-range", "accept-ranges", "last-modified", "etag"]) {
+  for (const h of [
+    "content-length", "content-range", "accept-ranges",
+    "last-modified", "etag",
+  ]) {
     const v = upstream.headers.get(h);
     if (v) respHeaders.set(h, v);
   }
